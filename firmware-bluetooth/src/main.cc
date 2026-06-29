@@ -1,3 +1,23 @@
+/*
+ * main.cc — HID Remapper Bluetooth firmware (modified for HID++ diversion)
+ *
+ * Changes vs upstream:
+ *  - Include hidpp.h; call hidpp_init() at startup.
+ *  - hidpp_discovery() called in discovery_completed_cb() while the GATT DM
+ *    context is still alive, before bt_hogp_handles_assign().
+ *  - hidpp_on_ready() called in hogp_ready_work_fn() after
+ *    device_connected_callback(), before bt_hogp_map_read().
+ *  - hogp_notify_cb() intercepts HID++ report IDs (0x10/0x11) via
+ *    hidpp_handle_input_report(); consumed messages are not forwarded to
+ *    handle_received_report().  A static synth_report_cb() injects the
+ *    synthetic 0xFD report into report_q for the remapper to see.
+ *  - Descriptor drain in main loop calls hidpp_amend_descriptor() before
+ *    parse_descriptor() to register the DPI button as a mappable usage.
+ *  - Disconnect drain calls hidpp_on_disconnect() alongside
+ *    device_disconnected_callback().
+ *  - Fix pre-existing one-byte overread in hogp_notify_cb memcpy.
+ */
+
 #include <errno.h>
 #include <stddef.h>
 
@@ -23,6 +43,7 @@
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
+#include "hidpp.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
@@ -62,7 +83,8 @@ struct report_type {
 struct descriptor_type {
     uint16_t size;
     uint8_t conn_idx;
-    uint8_t data[512];
+    /* Extra headroom for hidpp_amend_descriptor() patch bytes. */
+    uint8_t data[512 + HIDPP_DESCRIPTOR_PATCH_SIZE];
 };
 
 struct hogp_ready_type {
@@ -348,6 +370,20 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
 static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     LOG_INF("");
     patch_broken_uuids(dm);
+
+    /*
+     * Derive conn_idx from the context pointer.  gatt_discover() passes
+     * &hogps[conn_idx] as context, so pointer arithmetic recovers the index.
+     * This is valid since hogps[] is a flat array.
+     */
+    uint8_t conn_idx = (uint8_t)((struct bt_hogp*)context - hogps);
+
+    /*
+     * Walk GATT attrs to find HID++ output characteristic handles BEFORE
+     * bt_hogp_handles_assign() is called (after which the DM data is released).
+     */
+    hidpp_discovery(dm, conn_idx);
+
     CHK(bt_hogp_handles_assign(dm, ((struct bt_hogp*) context)));  // XXX disconnect if this fails?
     CHK(bt_gatt_dm_data_release(dm));
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
@@ -487,6 +523,37 @@ static int8_t hogp_index(struct bt_hogp* hogp) {
     return -1;
 }
 
+/* -------------------------------------------------------------------------
+ * HID++ synthetic report injection callback
+ *
+ * Called by hidpp_handle_input_report() (from hogp_notify_cb context, i.e.
+ * the BT system workqueue) when a diverted button changes state.  We package
+ * it as a normal report_type and push it onto report_q exactly as
+ * hogp_notify_cb does for regular input reports.
+ *
+ * data[0] = HIDPP_SYNTH_REPORT_ID (0xFD)
+ * payload = {0x01 pressed | 0x00 released}, len = 1
+ * ---------------------------------------------------------------------- */
+static void synth_report_cb(uint8_t conn_idx,
+                             uint8_t report_id,
+                             const uint8_t* payload,
+                             uint8_t len)
+{
+    static struct report_type buf;
+
+    buf.interface = (uint16_t)conn_idx << 8;
+    buf.len = (uint8_t)(len + 1);           /* +1 for the report ID prefix */
+    buf.data[0] = report_id;
+    if (len > 0 && len <= sizeof(buf.data) - 1) {
+        memcpy(buf.data + 1, payload, len);
+    }
+
+    if (k_msgq_put(&report_q, &buf, K_NO_WAIT) != 0) {
+        LOG_WRN("synth_report_cb: report_q full, dropping conn=%u repid=0x%02x",
+                conn_idx, report_id);
+    }
+}
+
 static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
     k_work_reschedule(&activity_led_off_work, K_MSEC(50));  // XXX what if work_fn is currently running? it might turn the led off after we turn it on
     gpio_pin_set_dt(&led0, true);
@@ -502,12 +569,38 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
 
-    static struct report_type buf;
-    buf.interface = hogp_index(hogp) << 8;
-    buf.len = bt_hogp_rep_size(rep) + 1;
-    buf.data[0] = bt_hogp_rep_id(rep);
+    uint8_t conn_idx  = (uint8_t)hogp_index(hogp);
+    uint8_t rep_id    = bt_hogp_rep_id(rep);
+    uint8_t rep_size  = bt_hogp_rep_size(rep);  /* payload length, no report ID */
 
-    memcpy(buf.data + 1, data, buf.len);
+    /*
+     * Offer the report to the HID++ handler first.  If it is a HID++
+     * protocol message (report IDs 0x10 or 0x11) that is part of the
+     * diversion handshake or a diverted button event, it is consumed here
+     * and must NOT be forwarded to handle_received_report().
+     */
+    if (hidpp_handle_input_report(conn_idx,
+                                  bt_hogp_conn(hogp),
+                                  rep_id,
+                                  data,
+                                  rep_size,
+                                  synth_report_cb)) {
+        return BT_GATT_ITER_CONTINUE;
+    }
+
+    /*
+     * Normal HID report path — forward to remapper via report_q.
+     *
+     * Fix: the original code had memcpy(buf.data + 1, data, buf.len) which
+     * over-read by 1 byte (buf.len = rep_size + 1, but data is only rep_size
+     * bytes).  Use buf.len - 1 (= rep_size) as the copy length.
+     */
+    static struct report_type buf;
+    buf.interface = (uint16_t)conn_idx << 8;  /* conn_idx already computed above */
+    buf.len = rep_size + 1;
+    buf.data[0] = rep_id;
+    memcpy(buf.data + 1, data, rep_size);  /* fixed: was buf.len (off by one) */
+
     if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
         //        printk("error in k_msg_put(report_q\n");
     }
@@ -552,14 +645,27 @@ static void hogp_ready_work_fn(struct k_work* work) {
     while (!k_msgq_get(&hogp_ready_q, &item, K_NO_WAIT)) {
         LOG_INF("hogp_ready");
 
+        struct bt_conn* conn = bt_hogp_conn(item.hogp);
+        uint8_t conn_idx = bt_conn_index(conn);
+
         struct find_bond_t find_bond = {
             .i = 0,
             .found_idx = 0,
         };
-        bt_addr_le_copy(&find_bond.addr, bt_conn_get_dst(bt_hogp_conn(item.hogp)));
+        bt_addr_le_copy(&find_bond.addr, bt_conn_get_dst(conn));
         bt_foreach_bond(BT_ID_DEFAULT, find_bond_cb, &find_bond);
         LOG_DBG("found bond idx: %d", find_bond.found_idx);
-        device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
+        device_connected_callback(conn_idx << 8, 1, 1, find_bond.found_idx);
+
+        /*
+         * Start HID++ probe sequence for this connection.
+         * hidpp_on_ready() sends GetFeature(0x1b04) if a HID++ output
+         * characteristic was found during GATT discovery; otherwise it is
+         * a no-op.  This must happen before bt_hogp_map_read() so that the
+         * HID++ state machine is initialised before any 0x10/0x11 notifications
+         * arrive via hogp_notify_cb.
+         */
+        hidpp_on_ready(conn_idx, conn);
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
@@ -905,6 +1011,10 @@ int main() {
     my_mutexes_init();
     button_init();
     leds_init();
+
+    /* Initialise HID++ per-connection state before the BT stack starts. */
+    hidpp_init();
+
     bt_init();
     CHK(settings_subsys_init());
     CHK(settings_register(&our_settings_handlers));
@@ -967,12 +1077,36 @@ int main() {
 
         while (!k_msgq_get(&disconnected_q, &disconnected_item, K_NO_WAIT)) {
             LOG_INF("device_disconnected_callback conn_idx=%d", disconnected_item.conn_idx);
+            /*
+             * Reset HID++ state for this connection BEFORE calling
+             * device_disconnected_callback() so any in-flight HID++ state
+             * is cleared before the remapper layer sees the disconnect.
+             */
+            hidpp_on_disconnect(disconnected_item.conn_idx);
             device_disconnected_callback(disconnected_item.conn_idx);
         }
 
         while (!k_msgq_get(&descriptor_q, &incoming_descriptor, K_NO_WAIT)) {
             LOG_HEXDUMP_DBG(incoming_descriptor.data, incoming_descriptor.size, "incoming_descriptor");
-            parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, incoming_descriptor.conn_idx << 8, 0);
+
+            /*
+             * Give HID++ a chance to append a synthetic descriptor fragment
+             * for diverted buttons BEFORE parse_descriptor() processes it.
+             * hidpp_amend_descriptor() is a no-op for non-HID++ devices.
+             * The descriptor_type buffer has HIDPP_DESCRIPTOR_PATCH_SIZE bytes
+             * of extra headroom beyond the 512-byte data[] array.
+             */
+            uint16_t desc_size = hidpp_amend_descriptor(
+                incoming_descriptor.conn_idx,
+                incoming_descriptor.data,
+                incoming_descriptor.size,
+                (uint16_t)sizeof(incoming_descriptor.data));
+
+            parse_descriptor(1, 1,
+                             incoming_descriptor.data,
+                             desc_size,
+                             (uint16_t)incoming_descriptor.conn_idx << 8,
+                             0);
         }
 
         if (resume_pending) {
